@@ -1,0 +1,690 @@
+---
+title: "Tissue pO~2~ and Neuronal Death in rTg4510 vs Wild-Type Mice"
+subtitle: "Mixed-effects logistic regression with rare-event and clustering safeguards"
+author: "Nancy E. Ruiz-Uribe"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 5, dpi = 150, fig.align = "center"
+)
+```
+
+# 1. Configuration
+
+Edit the two paths below; everything downstream is path-independent.
+
+```{r config}
+TG_FILE <- "data/Tg_results.xlsx"   # rTg4510
+WT_FILE <- "data/WT_results.xlsx"   # wild-type
+
+# Colour scheme (consistent across all figures)
+COL_TG    <- "#E87461"   # transgenic  (rTg4510)
+COL_WT    <- "#6497B1"   # wild-type
+COL_DYING <- "#B22222"   # dying neurons
+COL_ALIVE <- "#9AA5AD"   # non-dying neurons
+
+PO2_UNIT  <- 10          # report odds ratios per 10 mmHg
+SEED      <- 20260904
+set.seed(SEED)
+```
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(readxl)      # read the two workbooks
+  library(dplyr)       # data manipulation
+  library(tidyr)
+  library(ggplot2)     # figures
+  library(lme4)        # glmer  -- primary model
+  library(broom.mixed) # tidy() for merMod
+  library(brglm2)      # Firth penalised logistic -- rare-event safeguard
+  library(geepack)     # GEE with mouse as cluster -- robustness check
+  library(knitr)
+})
+
+theme_set(
+  theme_classic(base_size = 12) +
+    theme(
+      strip.background = element_blank(),
+      strip.text       = element_text(face = "bold"),
+      legend.position  = "top",
+      plot.title       = element_text(face = "bold")
+    )
+)
+```
+
+# 2. Data import and construction of the within-mouse predictor
+
+The two workbooks share the same schema: `CaseID` (mouse), `NeuronID`,
+`pO2` (mmHg), `z`, `isDying` (logical), `pO2c`.
+
+`NeuronID` is only unique **within** a mouse, so the neuron key is
+`CaseID` + `NeuronID`.
+
+```{r import}
+read_one <- function(path, genotype) {
+  read_excel(path, sheet = 1) |>
+    mutate(
+      Genotype = genotype,
+      CaseID   = as.character(CaseID),
+      isDying  = as.logical(isDying)
+    )
+}
+
+dat_raw <- bind_rows(
+  read_one(TG_FILE, "Tg"),
+  read_one(WT_FILE, "WT")
+)
+
+glimpse(dat_raw)
+```
+
+## 2.1 Recompute the centred predictors
+
+Baseline pO~2~ differs several-fold between mice, so the model uses
+**within-mouse centred** pO~2~: each neuron's deviation from its own
+mouse's mean. This asks the biologically pointed question — *within a
+given mouse, do dying neurons sit in lower-pO~2~ tissue than that same
+mouse's surviving neurons?* — and is immune to between-animal baseline
+differences, imaging session, and depth.
+
+We recompute rather than trust the supplied columns, then verify they
+agree.
+
+```{r center}
+dat <- dat_raw |>
+  group_by(CaseID) |>
+  mutate(
+    pO2_case_mean = mean(pO2),
+    pO2_case_sd   = sd(pO2),
+    pO2c_calc     = pO2 - pO2_case_mean,               # mmHg from mouse mean
+    z_calc        = (pO2 - pO2_case_mean) / pO2_case_sd # within-mouse SD units
+  ) |>
+  ungroup() |>
+  mutate(
+    Genotype  = factor(Genotype, levels = c("WT", "Tg")),  # WT = reference
+    Dying     = factor(isDying, levels = c(FALSE, TRUE),
+                       labels = c("Non-dying", "Dying")),
+    pO2c_10   = pO2c_calc / PO2_UNIT,   # per-10-mmHg within-mouse deviation
+    pO2_10    = pO2 / PO2_UNIT          # per-10-mmHg absolute (sensitivity)
+  )
+
+# Verify our centring reproduces the supplied columns
+tibble(
+  check          = c("pO2c", "z"),
+  max_abs_diff   = c(max(abs(dat$pO2c - dat$pO2c_calc)),
+                     max(abs(dat$z    - dat$z_calc)))
+) |> kable(digits = 10, caption = "Agreement with supplied columns")
+```
+
+## 2.2 Data audit
+
+```{r audit}
+stopifnot(
+  !any(is.na(dat$pO2)),
+  !any(is.na(dat$isDying)),
+  !anyDuplicated(dat[, c("CaseID", "NeuronID")])
+)
+
+per_mouse <- dat |>
+  group_by(Genotype, CaseID) |>
+  summarise(
+    n_neurons   = n(),
+    n_dying     = sum(isDying),
+    pct_dying   = 100 * mean(isDying),
+    pO2_mean    = mean(pO2),
+    pO2_sd      = sd(pO2),
+    pO2_dying   = ifelse(n_dying > 0, mean(pO2[isDying]), NA_real_),
+    pO2_alive   = mean(pO2[!isDying]),
+    delta_pO2c  = ifelse(n_dying > 0,
+                         mean(pO2c_calc[isDying]) - mean(pO2c_calc[!isDying]),
+                         NA_real_),
+    .groups = "drop"
+  )
+
+kable(per_mouse, digits = 2,
+      caption = "Per-mouse summary. delta_pO2c = mean within-mouse centred pO2 of dying minus non-dying neurons (negative = dying neurons in relatively hypoxic tissue).")
+```
+
+```{r event-count}
+cat("Total neurons:", nrow(dat),
+    "| Dying:", sum(dat$isDying),
+    sprintf("(%.2f%%)\n", 100 * mean(dat$isDying)))
+with(dat, table(Genotype, Dying)) |> kable(caption = "Events by genotype")
+```
+
+> **Events-per-variable warning.** There are only `r sum(dat$isDying)`
+> dying neurons in total. The usual rule of thumb is ~10 events per
+> estimated parameter, so the interaction model (3 fixed slopes +
+> variance component) is already at the edge of what these data
+> support. This is why we fit three estimators and a permutation test
+> rather than reporting a single p-value.
+
+# 3. Exploratory figures
+
+## 3.1 Raw pO~2~ per mouse, with dying neurons overlaid
+
+```{r fig-raw, fig.height=5.5}
+ggplot(dat, aes(x = reorder(CaseID, pO2_case_mean), y = pO2)) +
+  geom_violin(aes(fill = Genotype), colour = NA, alpha = 0.30,
+              scale = "width", trim = TRUE) +
+  geom_jitter(data = filter(dat, !isDying),
+              width = 0.14, height = 0, size = 0.7,
+              colour = COL_ALIVE, alpha = 0.35) +
+  geom_jitter(data = filter(dat, isDying),
+              width = 0.10, height = 0, size = 2.4,
+              colour = COL_DYING, shape = 18) +
+  stat_summary(fun = mean, geom = "point", shape = 95, size = 8,
+               colour = "black") +
+  scale_fill_manual(values = c(WT = COL_WT, Tg = COL_TG)) +
+  facet_grid(~ Genotype, scales = "free_x", space = "free_x") +
+  labs(
+    title = "Absolute tissue pO2 varies several-fold between mice",
+    subtitle = "Red diamonds = dying neurons; grey = non-dying; black bar = mouse mean",
+    x = NULL, y = expression(pO[2]~"(mmHg)")
+  ) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+This figure is the argument for within-mouse centring: mouse means span
+roughly `r round(min(per_mouse$pO2_mean))`–`r round(max(per_mouse$pO2_mean))` mmHg,
+which would otherwise dominate any absolute-pO~2~ comparison.
+
+## 3.2 Within-mouse centred pO~2~ by outcome
+
+```{r fig-centered}
+ggplot(dat, aes(x = Dying, y = pO2c_calc, fill = Genotype)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey55") +
+  geom_violin(colour = NA, alpha = 0.35, scale = "width") +
+  geom_jitter(width = 0.12, height = 0, size = 0.8, alpha = 0.35,
+              colour = COL_ALIVE) +
+  stat_summary(fun.data = mean_cl_boot, geom = "pointrange",
+               size = 0.6, colour = "black") +
+  scale_fill_manual(values = c(WT = COL_WT, Tg = COL_TG)) +
+  facet_wrap(~ Genotype) +
+  labs(
+    title = "Within-mouse centred pO2 in dying vs non-dying neurons",
+    subtitle = "Each neuron expressed as deviation from its own mouse's mean; black = mean +/- bootstrap 95% CI",
+    x = NULL, y = expression(Delta*pO[2]~"from mouse mean (mmHg)")
+  )
+```
+
+# 4. Primary model — mixed-effects logistic regression
+
+$$
+\text{logit}\;\Pr(\text{isDying}_{ij}=1)
+= \beta_0 + \beta_1\,\Delta pO_{2,ij}
++ \beta_2\,\text{Tg}_j
++ \beta_3\,(\Delta pO_{2,ij}\times \text{Tg}_j)
++ u_j,\qquad u_j\sim N(0,\sigma_u^2)
+$$
+
+for neuron $i$ in mouse $j$. The random intercept $u_j$ lets each mouse
+have its own baseline death rate (they range from
+`r sprintf('%.2f%%', min(per_mouse$pct_dying))` to
+`r sprintf('%.2f%%', max(per_mouse$pct_dying))`), which is what makes the
+neuron-level observations exchangeable within a mouse.
+
+```{r glmm}
+m_glmm <- glmer(
+  isDying ~ pO2c_10 * Genotype + (1 | CaseID),
+  data    = dat,
+  family  = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa",
+                         optCtrl = list(maxfun = 2e5))
+)
+
+summary(m_glmm)
+```
+
+## 4.1 Convergence and singularity diagnostics
+
+With only 7 clusters the variance component is hard to estimate; check
+before interpreting.
+
+```{r glmm-diag}
+cat("Singular fit:", isSingular(m_glmm, tol = 1e-4), "\n")
+cat("Random-intercept SD (logit scale):",
+    round(as.data.frame(VarCorr(m_glmm))$sdcor, 4), "\n\n")
+
+# Refit with several optimisers; fixed effects should be stable
+allfits <- allFit(m_glmm, verbose = FALSE)
+summary(allfits)$fixef |> round(3) |>
+  kable(caption = "Fixed effects across optimisers (should agree to ~2 decimals)")
+```
+
+> **On a singular fit.** With these data `lme4` estimates the
+> between-mouse variance at essentially **zero** once `Genotype` is in
+> the model — i.e. genotype already explains the differences in
+> baseline death rate across the 7 animals, leaving no residual
+> mouse-level variance to estimate. This is a boundary estimate, not a
+> convergence failure, and the fixed effects remain valid. It does mean
+> the random intercept is doing no work, so the **Firth model in §5.1**
+> — which removes each mouse's baseline exactly, as a fixed effect
+> rather than a draw from a normal distribution — is the more
+> defensible specification for the record. Report both.
+
+## 4.2 Odds ratios
+
+```{r glmm-or}
+or_glmm <- broom.mixed::tidy(m_glmm, effects = "fixed",
+                             conf.int = TRUE, exponentiate = TRUE) |>
+  select(term, OR = estimate, conf.low, conf.high, p.value)
+
+kable(or_glmm, digits = 3,
+      caption = paste0("GLMM odds ratios (pO2 terms are per ", PO2_UNIT,
+                       " mmHg of within-mouse deviation)"))
+```
+
+**How to read this table**
+
+| Term | Question it answers |
+|---|---|
+| `pO2c_10` | In **WT**, how do the odds of a neuron being dying change per 10 mmHg *above* its mouse's mean pO~2~? OR < 1 means dying neurons sit in relatively hypoxic tissue. |
+| `GenotypeTg` | Baseline odds of death in Tg vs WT at each mouse's own mean pO~2~ (with only 7 mice this is imprecise — it is essentially a 4-vs-3 comparison). |
+| `pO2c_10:GenotypeTg` | **The interaction.** Does the pO~2~–death relationship *differ* between Tg and WT? This is the headline test. |
+
+## 4.3 Genotype-specific slopes
+
+The `pO2c_10` coefficient is the WT slope only; the Tg slope is the sum
+of the main effect and the interaction. Extract both with their
+uncertainty.
+
+```{r slopes}
+b  <- fixef(m_glmm)
+
+# Build contrasts by NAME, not position, so this stays correct if the
+# model formula changes.
+mk <- function(terms) {
+  v <- setNames(numeric(length(b)), names(b))
+  v[terms] <- 1
+  v
+}
+L <- rbind(
+  WT = mk("pO2c_10"),
+  Tg = mk(c("pO2c_10", "pO2c_10:GenotypeTg"))
+)
+V  <- as.matrix(vcov(m_glmm))
+
+est <- as.vector(L %*% b)
+se  <- sqrt(diag(L %*% V %*% t(L)))
+
+slopes_tbl <- tibble(
+  Genotype = rownames(L),
+  logOR    = est,
+  SE       = se,
+  OR       = exp(est),
+  conf.low = exp(est - 1.96 * se),
+  conf.high= exp(est + 1.96 * se),
+  z        = est / se,
+  p.value  = 2 * pnorm(-abs(est / se))
+)
+
+kable(slopes_tbl, digits = 3,
+      caption = paste0("Genotype-specific pO2 slopes, per ", PO2_UNIT,
+                       " mmHg within-mouse deviation"))
+```
+
+## 4.4 Likelihood-ratio tests
+
+```{r lrt}
+m_no_int  <- update(m_glmm, . ~ pO2c_10 + Genotype + (1 | CaseID))
+m_no_pO2  <- update(m_glmm, . ~ Genotype + (1 | CaseID))
+
+anova(m_no_int, m_glmm) |>
+  kable(digits = 4, caption = "LRT: does the pO2 effect differ by genotype?")
+
+anova(m_no_pO2, m_no_int) |>
+  kable(digits = 4, caption = "LRT: is there any pO2 effect (common slope)?")
+```
+
+## 4.5 Predicted probability curve
+
+```{r fig-pred, fig.height=4.8}
+newd <- expand_grid(
+  pO2c_10  = seq(min(dat$pO2c_10), max(dat$pO2c_10), length.out = 200),
+  Genotype = factor(c("WT", "Tg"), levels = c("WT", "Tg"))
+)
+
+X    <- model.matrix(~ pO2c_10 * Genotype, newd)
+eta  <- as.vector(X %*% fixef(m_glmm))
+se_e <- sqrt(rowSums((X %*% as.matrix(vcov(m_glmm))) * X))
+
+newd <- newd |>
+  mutate(
+    fit = plogis(eta),
+    lo  = plogis(eta - 1.96 * se_e),
+    hi  = plogis(eta + 1.96 * se_e),
+    pO2c = pO2c_10 * PO2_UNIT
+  )
+
+ggplot(newd, aes(pO2c, fit, colour = Genotype, fill = Genotype)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.18, colour = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_rug(data = filter(dat, isDying),
+           aes(x = pO2c_calc, y = NULL), sides = "t",
+           inherit.aes = FALSE, colour = COL_DYING, alpha = 0.9) +
+  geom_rug(data = filter(dat, !isDying),
+           aes(x = pO2c_calc, y = NULL), sides = "b",
+           inherit.aes = FALSE, colour = COL_ALIVE, alpha = 0.25) +
+  scale_colour_manual(values = c(WT = COL_WT, Tg = COL_TG)) +
+  scale_fill_manual(values   = c(WT = COL_WT, Tg = COL_TG)) +
+  labs(
+    title = "Predicted probability that a neuron is dying",
+    subtitle = "Population-average (u = 0) with 95% CI; rug = dying (top, red) and non-dying (bottom, grey)",
+    x = expression(Delta*pO[2]~"from mouse mean (mmHg)"),
+    y = "Pr(dying)"
+  )
+```
+
+# 5. Rare-event and clustering safeguards
+
+Three independent estimators. **Agreement across them is the evidence;
+a result that appears in only one is not.**
+
+## 5.1 Firth penalised logistic regression
+
+Firth's penalty removes the small-sample bias of maximum likelihood and
+gives finite estimates even under separation. Here `CaseID` enters as a
+fixed effect — a *conditional* specification that removes each mouse's
+baseline exactly rather than assuming a normal distribution over 7
+mice.
+
+Note that `Genotype` is nested within `CaseID`, so a genotype *main*
+effect is not estimable alongside mouse fixed effects; it is absorbed.
+The interaction *is* estimable because it is a within-mouse contrast.
+
+```{r firth}
+m_firth <- glm(
+  isDying ~ CaseID + pO2c_10 + pO2c_10:Genotype,
+  data   = dat,
+  family = binomial("logit"),
+  method = "brglmFit",       # brglm2
+  type   = "AS_mean"         # = Firth's penalised likelihood
+)
+
+ci_firth <- suppressMessages(confint(m_firth))   # profile-likelihood CIs
+
+firth_tbl <- tibble(
+  term      = names(coef(m_firth)),
+  OR        = exp(coef(m_firth)),
+  conf.low  = exp(ci_firth[, 1]),
+  conf.high = exp(ci_firth[, 2]),
+  p.value   = coef(summary(m_firth))[, "Pr(>|z|)"]
+) |>
+  filter(grepl("pO2c_10", term))
+
+kable(firth_tbl, digits = 3,
+      caption = "Firth penalised estimates (mouse fixed effects absorbed; profile-likelihood CIs)")
+```
+
+`logistf::logistf(isDying ~ CaseID + pO2c_10 + pO2c_10:Genotype, data = dat, pl = TRUE)`
+is an equivalent alternative if you already have that package installed;
+`brglm2` is used here because it plugs directly into `glm()`.
+
+## 5.2 GEE with mouse as the cluster
+
+```{r gee}
+dat_gee <- dat |> arrange(CaseID) |> mutate(CaseID_f = factor(CaseID))
+
+m_gee <- geeglm(
+  as.integer(isDying) ~ pO2c_10 * Genotype,
+  id      = CaseID_f,
+  data    = dat_gee,
+  family  = binomial(link = "logit"),
+  corstr  = "exchangeable"
+)
+
+gee_tbl <- broom::tidy(m_gee, conf.int = TRUE, exponentiate = TRUE) |>
+  select(term, OR = estimate, conf.low, conf.high, p.value)
+
+kable(gee_tbl, digits = 3, caption = "GEE, exchangeable working correlation, robust SE")
+```
+
+> **Caveat.** The sandwich variance estimator is anti-conservative with
+> few clusters; the usual guidance is ~40+. With **7 mice** the GEE
+> p-values are optimistic and should be read as a directional
+> cross-check on the coefficient, not as inference.
+
+## 5.3 Within-mouse permutation test (assumption-free)
+
+The most trustworthy inference here. Under the null "dying status is
+unrelated to pO~2~ *within* a mouse," we can permute the `isDying`
+labels within each mouse and rebuild the null distribution directly.
+This respects the clustering exactly, makes no distributional
+assumption, and is unaffected by the small number of events.
+
+Statistic: the mean within-mouse centred pO~2~ of dying neurons,
+averaged over mice (mouse-weighted, so the 1,712-neuron mouse does not
+swamp the others).
+
+```{r permutation}
+N_PERM <- 10000
+
+perm_stat <- function(dying_vec, dat) {
+  d <- dat
+  d$dy <- dying_vec
+  d |>
+    group_by(Genotype, CaseID) |>
+    filter(sum(dy) > 0) |>
+    summarise(m = mean(pO2c_calc[dy]), .groups = "drop") |>
+    group_by(Genotype) |>
+    summarise(stat = mean(m), .groups = "drop")
+}
+
+obs <- perm_stat(dat$isDying, dat)
+
+null_draws <- replicate(N_PERM, {
+  shuffled <- dat |>
+    group_by(CaseID) |>
+    mutate(dy = sample(isDying)) |>
+    ungroup() |>
+    pull(dy)
+  s <- perm_stat(shuffled, dat)
+  c(WT = s$stat[s$Genotype == "WT"],
+    Tg = s$stat[s$Genotype == "Tg"])
+})
+
+perm_res <- tibble(
+  Genotype  = c("WT", "Tg"),
+  observed  = c(obs$stat[obs$Genotype == "WT"], obs$stat[obs$Genotype == "Tg"]),
+  null_mean = rowMeans(null_draws),
+  null_sd   = apply(null_draws, 1, sd),
+  p_two_sided = c(
+    mean(abs(null_draws["WT", ]) >= abs(obs$stat[obs$Genotype == "WT"])),
+    mean(abs(null_draws["Tg", ]) >= abs(obs$stat[obs$Genotype == "Tg"]))
+  )
+)
+
+kable(perm_res, digits = 4,
+      caption = paste0("Within-mouse permutation test, ", N_PERM,
+                       " permutations. Observed = mean centred pO2 of dying neurons (mmHg), mouse-weighted."))
+```
+
+```{r fig-perm, fig.height=4}
+tibble(
+  Genotype = rep(c("WT", "Tg"), each = N_PERM),
+  stat     = c(null_draws["WT", ], null_draws["Tg", ])
+) |>
+  mutate(Genotype = factor(Genotype, levels = c("WT", "Tg"))) |>
+  ggplot(aes(stat, fill = Genotype)) +
+  geom_histogram(bins = 60, colour = NA, alpha = 0.7) +
+  geom_vline(data = perm_res |>
+               mutate(Genotype = factor(Genotype, levels = c("WT", "Tg"))),
+             aes(xintercept = observed),
+             colour = COL_DYING, linewidth = 1) +
+  scale_fill_manual(values = c(WT = COL_WT, Tg = COL_TG)) +
+  facet_wrap(~ Genotype, scales = "free") +
+  labs(
+    title = "Permutation null vs observed",
+    subtitle = "Red line = observed mean centred pO2 of dying neurons",
+    x = expression("Mouse-weighted mean "*Delta*pO[2]*" of dying neurons (mmHg)"),
+    y = "Permutations"
+  )
+```
+
+## 5.4 Method comparison — forest plot
+
+```{r fig-forest, fig.height=4.2}
+comp <- bind_rows(
+  or_glmm  |> filter(grepl("pO2c_10", term)) |> mutate(Method = "GLMM (glmer)"),
+  firth_tbl                                   |> mutate(Method = "Firth (logistf)"),
+  gee_tbl  |> filter(grepl("pO2c_10", term)) |> mutate(Method = "GEE (geepack)")
+) |>
+  mutate(
+    term = recode(term,
+                  "pO2c_10"                = "pO2 slope (WT)",
+                  "pO2c_10:GenotypeTg"     = "pO2 slope difference (Tg - WT)"),
+    Method = factor(Method, levels = c("GLMM (glmer)", "Firth (logistf)", "GEE (geepack)"))
+  )
+
+kable(comp |> select(Method, term, OR, conf.low, conf.high, p.value),
+      digits = 3, caption = "All three estimators side by side")
+
+ggplot(comp, aes(x = OR, y = Method, colour = term)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "grey55") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
+                  position = position_dodge(width = 0.5), linewidth = 0.7) +
+  scale_x_log10() +
+  scale_colour_manual(values = c(COL_WT, COL_TG)) +
+  facet_wrap(~ term, ncol = 1, scales = "free_y") +
+  labs(
+    title = "Odds ratio per 10 mmHg of within-mouse pO2 deviation",
+    subtitle = "Consistency across estimators is the evidence",
+    x = "Odds ratio (log scale)", y = NULL, colour = NULL
+  ) +
+  theme(legend.position = "none")
+```
+
+# 6. Sensitivity analyses
+
+## 6.1 Within-mouse *z*-score instead of mmHg
+
+Mice differ in pO~2~ *spread* as well as mean. Rescaling to within-mouse
+SD units checks that the result is not driven by one wide-variance
+animal.
+
+```{r sens-z}
+m_z <- glmer(isDying ~ z_calc * Genotype + (1 | CaseID),
+             data = dat, family = binomial,
+             control = glmerControl(optimizer = "bobyqa",
+                                    optCtrl = list(maxfun = 2e5)))
+
+broom.mixed::tidy(m_z, effects = "fixed", conf.int = TRUE,
+                  exponentiate = TRUE) |>
+  select(term, OR = estimate, conf.low, conf.high, p.value) |>
+  kable(digits = 3, caption = "OR per 1 within-mouse SD of pO2")
+```
+
+## 6.2 Absolute pO~2~ (not recommended as primary)
+
+Shown for completeness. With 7 mice the between-animal differences in
+Figure 3.1 are only partially absorbed by the random intercept, so this
+estimate blends within- and between-mouse variation.
+
+```{r sens-raw}
+m_raw <- glmer(isDying ~ pO2_10 * Genotype + (1 | CaseID),
+               data = dat, family = binomial,
+               control = glmerControl(optimizer = "bobyqa",
+                                      optCtrl = list(maxfun = 2e5)))
+
+broom.mixed::tidy(m_raw, effects = "fixed", conf.int = TRUE,
+                  exponentiate = TRUE) |>
+  select(term, OR = estimate, conf.low, conf.high, p.value) |>
+  kable(digits = 3, caption = "Absolute pO2 model, OR per 10 mmHg")
+```
+
+## 6.3 Leave-one-mouse-out
+
+With 7 animals, one mouse can drive the whole result. Refit dropping
+each in turn.
+
+```{r loo}
+loo <- lapply(unique(dat$CaseID), function(cs) {
+  d <- filter(dat, CaseID != cs)
+  fit <- try(glmer(isDying ~ pO2c_10 * Genotype + (1 | CaseID),
+                   data = d, family = binomial,
+                   control = glmerControl(optimizer = "bobyqa",
+                                          optCtrl = list(maxfun = 2e5))),
+             silent = TRUE)
+  if (inherits(fit, "try-error")) return(NULL)
+  b <- fixef(fit); s <- sqrt(diag(as.matrix(vcov(fit))))
+  tibble(
+    dropped      = cs,
+    OR_pO2_WT    = exp(b["pO2c_10"]),
+    OR_interact  = exp(b["pO2c_10:GenotypeTg"]),
+    p_interact   = 2 * pnorm(-abs(b["pO2c_10:GenotypeTg"] /
+                                    s[names(b) == "pO2c_10:GenotypeTg"]))
+  )
+}) |> bind_rows()
+
+kable(loo, digits = 3,
+      caption = "Leave-one-mouse-out. Large swings mean the result rests on a single animal.")
+```
+
+# 7. Summary of findings
+
+```{r summary-numbers}
+summ <- tibble(
+  Quantity = c(
+    "WT slope, OR per 10 mmHg (GLMM)",
+    "Tg slope, OR per 10 mmHg (GLMM)",
+    "Interaction OR (Tg vs WT), GLMM",
+    "Interaction OR, Firth",
+    "Interaction OR, GEE",
+    "LRT p, interaction",
+    "LRT p, any pO2 effect",
+    "Permutation p, WT",
+    "Permutation p, Tg"
+  ),
+  Value = c(
+    sprintf("%.2f [%.2f, %.2f]", slopes_tbl$OR[1], slopes_tbl$conf.low[1], slopes_tbl$conf.high[1]),
+    sprintf("%.2f [%.2f, %.2f]", slopes_tbl$OR[2], slopes_tbl$conf.low[2], slopes_tbl$conf.high[2]),
+    sprintf("%.2f", or_glmm$OR[or_glmm$term == "pO2c_10:GenotypeTg"]),
+    sprintf("%.2f", firth_tbl$OR[grepl(":", firth_tbl$term)]),
+    sprintf("%.2f", gee_tbl$OR[gee_tbl$term == "pO2c_10:GenotypeTg"]),
+    sprintf("%.3f", anova(m_no_int, m_glmm)$`Pr(>Chisq)`[2]),
+    sprintf("%.3f", anova(m_no_pO2, m_no_int)$`Pr(>Chisq)`[2]),
+    sprintf("%.3f", perm_res$p_two_sided[perm_res$Genotype == "WT"]),
+    sprintf("%.3f", perm_res$p_two_sided[perm_res$Genotype == "Tg"])
+  )
+)
+kable(summ, caption = "Headline numbers, auto-filled from the fitted models")
+```
+
+**Reading these data.** Fill in the narrative once you have run the
+document, but the structure of the answer is:
+
+1. **Genotype effect on death rate** — the `GenotypeTg` term. This is
+   the one term with a large, precisely estimated effect, and it is
+   what you would expect: rTg4510 neurons die at a much higher rate.
+   Treat its confidence interval with caution — it rests on 4 vs 3
+   animals, so the *precision* is overstated even though the direction
+   is clear.
+2. **pO~2~ effect within mice** — the `pO2c_10` slope. An OR near 1
+   with a CI spanning it means these data do not show dying neurons
+   sitting in relatively hypoxic tissue *within* an animal.
+3. **The interaction** — whether the pO~2~–death relationship differs
+   by genotype. Compare the GLMM, Firth, GEE, and permutation results
+   in §5.4; only a finding that survives all four is worth reporting.
+4. **Power** — with `r sum(dat$isDying)` events, the CIs in §4.3 tell
+   you what effect sizes these data could have detected. If the
+   interval spans, say, 0.5 to 1.9, the study is compatible with a
+   two-fold effect in either direction, and "no significant difference"
+   should be written as "underpowered to detect", not "no effect".
+
+# 8. Reproducibility
+
+```{r session}
+sessionInfo()
+```
