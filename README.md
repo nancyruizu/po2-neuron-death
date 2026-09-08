@@ -1,6 +1,7 @@
 # Tissue pO₂ and neuronal death in rTg4510 and wild-type mice
 
-Analysis code accompanying **[manuscript title]**, [authors], [journal/preprint], [year].
+Analysis code accompanying the manuscript: Tau induces depth-dependent alterations in cerebral blood and tissue oxygenation in the rTg4510 and THY-Tau22 mouse models of Alzheimer’s disease,
+by: Nancy E. Ruiz-Uribe, Mohammed Alfadhel, Nina Wolf, Sophia Esperanza Murray, Elaina Gross, Ava Devine, Theodore Zwang, Martin Thunemann, Sava Sakadzic, Rachel E Bennett. 2026
 
 This repository reproduces the statistical analysis and figure panel testing whether
 neurons that disappear over a 4-week in vivo imaging window are located in relatively
